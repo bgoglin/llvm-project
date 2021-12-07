@@ -985,6 +985,8 @@ extern omp_allocator_handle_t __kmp_def_allocator;
 
 extern int __kmp_memkind_available;
 
+extern int __kmp_hwloc_available;
+
 typedef omp_memspace_handle_t kmp_memspace_t; // placeholder
 
 typedef struct kmp_allocator_t {
@@ -1027,6 +1029,9 @@ extern void ___kmpc_free(int gtid, void *ptr, omp_allocator_handle_t al);
 extern void __kmp_init_memkind();
 extern void __kmp_fini_memkind();
 extern void __kmp_init_target_mem();
+
+extern void __kmp_init_hwloc();
+extern void __kmp_fini_hwloc();
 
 /* ------------------------------------------------------------------------ */
 

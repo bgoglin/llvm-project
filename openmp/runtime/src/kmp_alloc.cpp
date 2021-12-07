@@ -14,6 +14,8 @@
 #include "kmp_io.h"
 #include "kmp_wrapper_malloc.h"
 
+#include <hwloc.h>
+
 // Disable bget when it is not used
 #if KMP_USE_BGET
 
@@ -1527,6 +1529,34 @@ void __kmpc_free(int gtid, void *ptr, omp_allocator_handle_t allocator) {
   ___kmpc_free(gtid, ptr, allocator);
   KE_TRACE(10, ("__kmpc_free: T#%d freed %p (%p)\n", gtid, ptr, allocator));
   return;
+}
+
+static hwloc_topology_t topology;
+
+void __kmp_init_hwloc(void)
+{
+  int err;
+
+  printf("__kmp_init_hwloc\n");
+
+  // FIXME share the existing KMP topology
+
+  err = hwloc_topology_init(&topology);
+  if (!err) {
+    err = hwloc_topology_load(topology);
+    if (!err)
+      __kmp_hwloc_available = 1;
+    else
+      hwloc_topology_destroy(topology);
+  }
+}
+
+void __kmp_fini_hwloc(void)
+{
+  if (__kmp_hwloc_available)
+    hwloc_topology_destroy(topology);
+
+  printf("__kmp_fini_hwloc\n");
 }
 
 // internal implementation, called from inside the library
