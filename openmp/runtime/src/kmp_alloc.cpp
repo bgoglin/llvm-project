@@ -1586,21 +1586,30 @@ void *__kmp_alloc(int gtid, size_t algn, size_t size,
   desc.size_a = size + sz_desc + align;
 
   if (__kmp_hwloc_available) {
-    if (allocator == omp_high_bw_mem_alloc) {
+    if (allocator == omp_high_bw_mem_alloc
+	|| allocator == omp_low_lat_mem_alloc
+	|| allocator == omp_large_cap_mem_alloc) {
       hwloc_bitmap_t cpuset;
       struct hwloc_location initiator;
       hwloc_obj_t node;
+      hwloc_memattr_id_t mid = allocator == omp_high_bw_mem_alloc ? HWLOC_MEMATTR_ID_BANDWIDTH
+	: allocator == omp_low_lat_mem_alloc ? HWLOC_MEMATTR_ID_LATENCY
+	: HWLOC_MEMATTR_ID_CAPACITY;
       cpuset = hwloc_bitmap_alloc();
       if (cpuset) {
 	hwloc_get_last_cpu_location(topology, cpuset, HWLOC_CPUBIND_THREAD); /* FIXME: does the runtime know the current binding? */
 	initiator.type = HWLOC_LOCATION_TYPE_CPUSET;
 	initiator.location.cpuset = cpuset;
-	if (hwloc_memattr_get_best_target(topology, HWLOC_MEMATTR_ID_BANDWIDTH, &initiator, 0, &node, NULL) == 0) {
+	if (hwloc_memattr_get_best_target(topology, mid, &initiator, 0, &node, NULL) == 0) {
+	  printf("got node L%u P%u for attr %u\n", node->logical_index, node->os_index, mid);
 	  ptr = hwloc_alloc_membind_policy(topology, desc.size_a, node->nodeset, HWLOC_MEMBIND_BIND, HWLOC_MEMBIND_BYNODESET);
 	  if (ptr) {
+	    // TODO mark desc as allocated with hwloc so that kmp_free knows for sure how to deallocate
 	    hwloc_bitmap_free(cpuset);
 	    goto ready;
 	  }
+	} else {
+	  printf("got no node for attr %u\n", mid);
 	}
 	hwloc_bitmap_free(cpuset);
       }
@@ -1850,7 +1859,9 @@ void ___kmpc_free(int gtid, void *ptr, omp_allocator_handle_t allocator) {
   KMP_DEBUG_ASSERT(al);
 
   if (__kmp_hwloc_available) {
-    if (allocator == omp_high_bw_mem_alloc) {
+    if (allocator == omp_high_bw_mem_alloc
+	|| allocator == omp_low_lat_mem_alloc
+	|| allocator == omp_large_cap_mem_alloc) {
       hwloc_free(topology, desc.ptr_alloc, desc.size_a);
       return;
     }
