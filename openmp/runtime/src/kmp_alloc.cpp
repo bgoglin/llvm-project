@@ -1485,6 +1485,7 @@ typedef struct kmp_mem_desc { // Memory block descriptor
   size_t size_orig; // Original size requested
   void *ptr_align; // Pointer to aligned memory, returned
   kmp_allocator_t *allocator; // allocator
+  int hwloc_allocated; // Whether hwloc provided the memory
 } kmp_mem_desc_t;
 static int alignment = sizeof(void *); // align to pointer size by default
 
@@ -1584,6 +1585,7 @@ void *__kmp_alloc(int gtid, size_t algn, size_t size,
     align = algn; // max of allocator trait, parameter and sizeof(void*)
   desc.size_orig = size;
   desc.size_a = size + sz_desc + align;
+  desc.hwloc_allocated = 0;
 
   if (__kmp_hwloc_available) {
     if (allocator == omp_high_bw_mem_alloc
@@ -1604,7 +1606,7 @@ void *__kmp_alloc(int gtid, size_t algn, size_t size,
 	  printf("got node L%u P%u for attr %u\n", node->logical_index, node->os_index, mid);
 	  ptr = hwloc_alloc_membind_policy(topology, desc.size_a, node->nodeset, HWLOC_MEMBIND_BIND, HWLOC_MEMBIND_BYNODESET);
 	  if (ptr) {
-	    // TODO mark desc as allocated with hwloc so that kmp_free knows for sure how to deallocate
+	    desc.hwloc_allocated = 1;
 	    hwloc_bitmap_free(cpuset);
 	    goto ready;
 	  }
@@ -1742,11 +1744,12 @@ void *__kmp_alloc(int gtid, size_t algn, size_t size,
       KMP_ASSERT(0); // abort fallback requested
     } // no sense to look for another fallback because of same internal alloc
   }
+
+ready:
   KE_TRACE(10, ("__kmp_alloc: T#%d %p=alloc(%d)\n", gtid, ptr, desc.size_a));
   if (ptr == NULL)
     return NULL;
 
- ready:
   addr = (kmp_uintptr_t)ptr;
   addr_align = (addr + sz_desc + align - 1) & ~(align - 1);
   addr_descr = addr_align - sz_desc;
@@ -1859,9 +1862,7 @@ void ___kmpc_free(int gtid, void *ptr, omp_allocator_handle_t allocator) {
   KMP_DEBUG_ASSERT(al);
 
   if (__kmp_hwloc_available) {
-    if (allocator == omp_high_bw_mem_alloc
-	|| allocator == omp_low_lat_mem_alloc
-	|| allocator == omp_large_cap_mem_alloc) {
+    if (desc.hwloc_allocated) {
       hwloc_free(topology, desc.ptr_alloc, desc.size_a);
       return;
     }
