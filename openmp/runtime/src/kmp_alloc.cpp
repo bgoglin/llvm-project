@@ -1532,30 +1532,38 @@ void __kmpc_free(int gtid, void *ptr, omp_allocator_handle_t allocator) {
   return;
 }
 
-static hwloc_topology_t topology;
-
 void __kmp_init_hwloc(void)
 {
-  int err;
-
   printf("__kmp_init_hwloc\n");
 
-  // FIXME share the existing KMP topology
+  const char err_msg[] = "KMP_INIT_HWLOC: Hwloc failed in %s. No hwloc-based "
+    "allocation mechanism will be provided.\n";
+  KMP_DEBUG_USE_VAR(err_msg);
 
-  err = hwloc_topology_init(&topology);
-  if (!err) {
-    err = hwloc_topology_load(topology);
-    if (!err)
-      __kmp_hwloc_available = 1;
-    else
-      hwloc_topology_destroy(topology);
+  if (__kmp_hwloc_topology == NULL) {
+    if (hwloc_topology_init(&__kmp_hwloc_topology) < 0) {
+      __kmp_hwloc_error = TRUE;
+      KE_TRACE(10, (err_msg, "hwloc_topology_init()"));
+    }
+    if (hwloc_topology_load(__kmp_hwloc_topology) < 0) {
+      __kmp_hwloc_error = TRUE;
+      KE_TRACE(10, (err_msg, "hwloc_topology_load()"));
+    }
   }
+  KMP_DEBUG_USE_VAR(err_msg);
+  __kmp_hwloc_available = !__kmp_hwloc_error;
 }
 
 void __kmp_fini_hwloc(void)
 {
-  if (__kmp_hwloc_available)
-    hwloc_topology_destroy(topology);
+  if (__kmp_hwloc_available) {
+    /* TODO: Potentially free __kmp_hwloc_topology if it was allocated in
+     * __kmp_init_hwloc(). We may want to check whether kmp_alloc is initialised
+     * before or after kmp_affinity, and in any case if there are cases where
+     * the destroy phase of the topology is skipped, and if so, how to detect it
+     * and ensure __kmp_hwloc_topology is finally destroyed. */
+    /* hwloc_topology_destroy(__kmp_hwloc_topology); */
+  }
 
   printf("__kmp_fini_hwloc\n");
 }
@@ -1599,12 +1607,12 @@ void *__kmp_alloc(int gtid, size_t algn, size_t size,
 	: HWLOC_MEMATTR_ID_CAPACITY;
       cpuset = hwloc_bitmap_alloc();
       if (cpuset) {
-	hwloc_get_last_cpu_location(topology, cpuset, HWLOC_CPUBIND_THREAD); /* FIXME: does the runtime know the current binding? */
+	hwloc_get_last_cpu_location(__kmp_hwloc_topology, cpuset, HWLOC_CPUBIND_THREAD); /* FIXME: does the runtime know the current binding? */
 	initiator.type = HWLOC_LOCATION_TYPE_CPUSET;
 	initiator.location.cpuset = cpuset;
-	if (hwloc_memattr_get_best_target(topology, mid, &initiator, 0, &node, NULL) == 0) {
+	if (hwloc_memattr_get_best_target(__kmp_hwloc_topology, mid, &initiator, 0, &node, NULL) == 0) {
 	  printf("got node L%u P%u for attr %u\n", node->logical_index, node->os_index, mid);
-	  ptr = hwloc_alloc_membind_policy(topology, desc.size_a, node->nodeset, HWLOC_MEMBIND_BIND, HWLOC_MEMBIND_BYNODESET);
+	  ptr = hwloc_alloc_membind_policy(__kmp_hwloc_topology, desc.size_a, node->nodeset, HWLOC_MEMBIND_BIND, HWLOC_MEMBIND_BYNODESET);
 	  if (ptr) {
 	    desc.hwloc_allocated = 1;
 	    hwloc_bitmap_free(cpuset);
@@ -1863,7 +1871,7 @@ void ___kmpc_free(int gtid, void *ptr, omp_allocator_handle_t allocator) {
 
   if (__kmp_hwloc_available) {
     if (desc.hwloc_allocated) {
-      hwloc_free(topology, desc.ptr_alloc, desc.size_a);
+      hwloc_free(__kmp_hwloc_topology, desc.ptr_alloc, desc.size_a);
       return;
     }
   }
