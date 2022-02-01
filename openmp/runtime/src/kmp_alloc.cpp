@@ -1534,7 +1534,7 @@ void __kmpc_free(int gtid, void *ptr, omp_allocator_handle_t allocator) {
 
 void __kmp_init_hwloc(void)
 {
-  printf("__kmp_init_hwloc\n");
+  fprintf(stderr, "__kmp_init_hwloc\n");
 
   const char err_msg[] = "KMP_INIT_HWLOC: Hwloc failed in %s. No hwloc-based "
     "allocation mechanism will be provided.\n";
@@ -1570,7 +1570,7 @@ void __kmp_fini_hwloc(void)
     /* hwloc_topology_destroy(__kmp_hwloc_topology); */
   }
 
-  printf("__kmp_fini_hwloc\n");
+  fprintf(stderr, "__kmp_fini_hwloc\n");
 }
 
 static int __kmp_hwloc_get_best_target(hwloc_topology_t topology,
@@ -1691,7 +1691,10 @@ void *__kmp_alloc(int gtid, size_t algn, size_t size,
           node_flags = HWLOC_LOCAL_NUMANODE_FLAG_LARGER_LOCALITY | HWLOC_LOCAL_NUMANODE_FLAG_SMALLER_LOCALITY;
         }
         if (__kmp_hwloc_get_best_target(__kmp_hwloc_topology, mid, &initiator, &node, node_flags) == 0) {
-	  printf("got node L%u P%u for attr %u\n", node->logical_index, node->os_index, mid);
+          constexpr ssize_t max_len = 1024;
+          char cpuset_str[max_len];
+          int len = hwloc_bitmap_snprintf(cpuset_str, max_len, cpuset);
+          fprintf(stderr, "got node L%u P%u for attr %u from node %s%s\n", node->logical_index, node->os_index, mid, cpuset_str, len > max_len ? " (truncated)" : "");
 	  ptr = hwloc_alloc_membind_policy(__kmp_hwloc_topology, desc.size_a, node->nodeset, HWLOC_MEMBIND_BIND, HWLOC_MEMBIND_BYNODESET);
 	  if (ptr) {
 	    desc.hwloc_allocated = 1;
@@ -1699,7 +1702,7 @@ void *__kmp_alloc(int gtid, size_t algn, size_t size,
 	    goto ready;
 	  }
 	} else {
-	  printf("got no node for attr %u\n", mid);
+	  fprintf(stderr,"got no node for attr %u\n", mid);
 	}
 	hwloc_bitmap_free(cpuset);
       }
