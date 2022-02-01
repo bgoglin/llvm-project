@@ -1557,11 +1557,16 @@ void __kmp_init_hwloc(void)
 void __kmp_fini_hwloc(void)
 {
   if (__kmp_hwloc_available) {
-    /* TODO: Potentially free __kmp_hwloc_topology if it was allocated in
-     * __kmp_init_hwloc(). We may want to check whether kmp_alloc is initialised
-     * before or after kmp_affinity, and in any case if there are cases where
-     * the destroy phase of the topology is skipped, and if so, how to detect it
-     * and ensure __kmp_hwloc_topology is finally destroyed. */
+    /* __kmp_hwloc_topology in globals will be initialised *AFTER* we
+     * initialise the allocator.  Therefore, we will be doing the
+     * initialisation ourselves.  On the other hand, the clean-up phase of the
+     * global variables is being done in __kmp_affinity_uninitialize(), called
+     * by __kmp_cleanup(), called by __kmp_internal_end(), which is called by
+     * __kmp_internal_end_library() couple lines before calling
+     * __kmp_fini_allocator() which calls us.  Thus, the topology should have
+     * already been destroyed by the time we reach this point in the code.
+     * Hopefully, there is no release of memory expected from any allocator
+     * between these two steps. */
     /* hwloc_topology_destroy(__kmp_hwloc_topology); */
   }
 
