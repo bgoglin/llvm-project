@@ -1573,6 +1573,65 @@ void __kmp_fini_hwloc(void)
   printf("__kmp_fini_hwloc\n");
 }
 
+static int __kmp_hwloc_get_best_target(hwloc_topology_t topology,
+                                       hwloc_memattr_id_t mid,
+                                       struct hwloc_location *initiator,
+                                       hwloc_obj_t *node,
+                                       unsigned long node_flags) {
+  if (node_flags & HWLOC_LOCAL_NUMANODE_FLAG_ALL) {
+    return hwloc_memattr_get_best_target(topology, mid, initiator, 0, node, NULL);
+  }
+  /* We have to traverse the targets ourself to find the best one that is also
+   * included in our subset. */
+  unsigned nnodes;
+  hwloc_const_nodeset_t topo_nodeset = hwloc_topology_get_topology_nodeset(topology);
+  const unsigned max_nnodes = nnodes = hwloc_bitmap_weight(topo_nodeset);
+  hwloc_obj_t *nodes = (hwloc_obj_t *) malloc(sizeof(hwloc_obj_t[max_nnodes]));
+  KMP_ASSERT(nodes);
+  if (hwloc_get_local_numanode_objs(topology, initiator, &nnodes, nodes, node_flags) < 0) {
+    KE_TRACE(30, ("__kmp_alloc (hwloc): Unable to retrieve the NUMA local objects.\n"));
+    free(nodes);
+    return -1;
+  } else if (nnodes > max_nnodes) {
+    KE_TRACE(30, ("__kmp_alloc (hwloc): Unable to retrieve all the nodes "
+                  "(nnodes: %d, max_nnodes: %d).\n", nnodes, max_nnodes));
+  }
+  /* Search for the best target */
+  int found = 0;
+  hwloc_uint64_t best_value;
+  unsigned long memattr_flags =
+      mid == HWLOC_MEMATTR_ID_CAPACITY  ? HWLOC_MEMATTR_FLAG_HIGHER_FIRST
+    : mid == HWLOC_MEMATTR_ID_LOCALITY  ? HWLOC_MEMATTR_FLAG_HIGHER_FIRST
+    : mid == HWLOC_MEMATTR_ID_BANDWIDTH ? HWLOC_MEMATTR_FLAG_HIGHER_FIRST
+    : mid == HWLOC_MEMATTR_ID_LATENCY   ? HWLOC_MEMATTR_FLAG_LOWER_FIRST
+    : 0;
+  if (!memattr_flags) {
+    if (hwloc_memattr_get_flags(topology, mid, &memattr_flags) < 0) {
+      KE_TRACE(30, ("__kmp_alloc (hwloc): Unable to retrieve memattr flags.\n"));
+      return -1;
+    }
+  }
+  for (size_t nid = 0; nid < nnodes; ++nid) {
+    hwloc_uint64_t val;
+    if (hwloc_memattr_get_value(topology, mid, nodes[nid], initiator, 0, &val) == 0) {
+      if (found) {
+        if (HWLOC_MEMATTR_FLAG_HIGHER_FIRST & memattr_flags) {
+          if (best_value >= val)
+            continue;
+        } else {
+          if (best_value <= val)
+            continue;
+        }
+      }
+      best_value = val;
+      *node = nodes[nid];
+      found = 1;
+    }
+  }
+  free(nodes);
+  return !found;
+}
+
 // internal implementation, called from inside the library
 void *__kmp_alloc(int gtid, size_t algn, size_t size,
                   omp_allocator_handle_t allocator) {
@@ -1601,21 +1660,37 @@ void *__kmp_alloc(int gtid, size_t algn, size_t size,
   desc.hwloc_allocated = 0;
 
   if (__kmp_hwloc_available) {
-    if (allocator == omp_high_bw_mem_alloc
-	|| allocator == omp_low_lat_mem_alloc
-	|| allocator == omp_large_cap_mem_alloc) {
+    omp_memspace_handle_t memspace = al->memspace;
+    if (allocator < kmp_max_mem_alloc) {
+      /* If we have a predefined allocator, retrieve the allocation space */
+      memspace = allocator == omp_default_mem_alloc ? omp_default_mem_space
+        : allocator == omp_const_mem_alloc ? omp_const_mem_space
+        : allocator == omp_high_bw_mem_alloc ? omp_high_bw_mem_space
+        : allocator == omp_low_lat_mem_alloc ? omp_low_lat_mem_space
+        : allocator == omp_large_cap_mem_alloc ? omp_large_cap_mem_space
+        : (omp_memspace_handle_t) -1;
+    }
+    if (memspace == omp_high_bw_mem_space
+        || memspace == omp_low_lat_mem_space
+        || memspace == omp_large_cap_mem_space) {
       hwloc_bitmap_t cpuset;
       struct hwloc_location initiator;
       hwloc_obj_t node;
-      hwloc_memattr_id_t mid = allocator == omp_high_bw_mem_alloc ? HWLOC_MEMATTR_ID_BANDWIDTH
-	: allocator == omp_low_lat_mem_alloc ? HWLOC_MEMATTR_ID_LATENCY
-	: HWLOC_MEMATTR_ID_CAPACITY;
+      hwloc_memattr_id_t mid = memspace == omp_high_bw_mem_space ? HWLOC_MEMATTR_ID_BANDWIDTH
+        : memspace == omp_low_lat_mem_space ? HWLOC_MEMATTR_ID_LATENCY
+        : /* memspace == omp_large_cap_mem_space ? */ HWLOC_MEMATTR_ID_CAPACITY;
       cpuset = hwloc_bitmap_alloc();
       if (cpuset) {
 	hwloc_get_last_cpu_location(__kmp_hwloc_topology, cpuset, HWLOC_CPUBIND_THREAD); /* FIXME: does the runtime know the current binding? */
 	initiator.type = HWLOC_LOCATION_TYPE_CPUSET;
 	initiator.location.cpuset = cpuset;
-	if (hwloc_memattr_get_best_target(__kmp_hwloc_topology, mid, &initiator, 0, &node, NULL) == 0) {
+        unsigned long node_flags = HWLOC_LOCAL_NUMANODE_FLAG_ALL;
+        /* TODO: maybe restrict the search to a subset of topology's nodes if
+         * the user wants to? */
+        if (mid == HWLOC_MEMATTR_ID_CAPACITY) {
+          node_flags = HWLOC_LOCAL_NUMANODE_FLAG_LARGER_LOCALITY | HWLOC_LOCAL_NUMANODE_FLAG_SMALLER_LOCALITY;
+        }
+        if (__kmp_hwloc_get_best_target(__kmp_hwloc_topology, mid, &initiator, &node, node_flags) == 0) {
 	  printf("got node L%u P%u for attr %u\n", node->logical_index, node->os_index, mid);
 	  ptr = hwloc_alloc_membind_policy(__kmp_hwloc_topology, desc.size_a, node->nodeset, HWLOC_MEMBIND_BIND, HWLOC_MEMBIND_BYNODESET);
 	  if (ptr) {
