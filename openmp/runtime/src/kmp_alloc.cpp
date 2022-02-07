@@ -1540,6 +1540,7 @@ void __kmp_init_hwloc(void)
     "allocation mechanism will be provided.\n";
   KMP_DEBUG_USE_VAR(err_msg);
 
+#if KMP_USE_HWLOC
   if (__kmp_hwloc_topology == NULL) {
     if (hwloc_topology_init(&__kmp_hwloc_topology) < 0) {
       __kmp_hwloc_error = TRUE;
@@ -1550,13 +1551,14 @@ void __kmp_init_hwloc(void)
       KE_TRACE(10, (err_msg, "hwloc_topology_load()"));
     }
   }
-  KMP_DEBUG_USE_VAR(err_msg);
   __kmp_hwloc_available = !__kmp_hwloc_error;
+#endif // KMP_USE_HWLOC
 }
 
 void __kmp_fini_hwloc(void)
 {
   if (__kmp_hwloc_available) {
+#if KMP_USE_HWLOC
     /* __kmp_hwloc_topology in globals will be initialised *AFTER* we
      * initialise the allocator.  Therefore, we will be doing the
      * initialisation ourselves.  On the other hand, the clean-up phase of the
@@ -1568,6 +1570,7 @@ void __kmp_fini_hwloc(void)
      * Hopefully, there is no release of memory expected from any allocator
      * between these two steps. */
     /* hwloc_topology_destroy(__kmp_hwloc_topology); */
+#endif // KMP_USE_HWLOC
   }
 
   fprintf(stderr, "__kmp_fini_hwloc\n");

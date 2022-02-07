@@ -240,14 +240,14 @@ int __kmp_clock_function_param;
 enum mic_type __kmp_mic_type = non_mic;
 #endif
 
-#if KMP_AFFINITY_SUPPORTED
-
-KMPAffinity *__kmp_affinity_dispatch = NULL;
-
 #if KMP_USE_HWLOC
 int __kmp_hwloc_error = FALSE;
 hwloc_topology_t __kmp_hwloc_topology = NULL;
 #endif
+
+#if KMP_AFFINITY_SUPPORTED
+
+KMPAffinity *__kmp_affinity_dispatch = NULL;
 
 #if KMP_OS_WINDOWS
 #if KMP_GROUP_AFFINITY

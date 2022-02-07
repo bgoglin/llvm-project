@@ -92,8 +92,9 @@ class kmp_stats_list;
 #define KMP_USE_HIER_SCHED KMP_AFFINITY_SUPPORTED
 #endif
 
-#if KMP_USE_HWLOC && KMP_AFFINITY_SUPPORTED
+#if KMP_USE_HWLOC
 #include "hwloc.h"
+#if KMP_AFFINITY_SUPPORTED
 #ifndef HWLOC_OBJ_NUMANODE
 #define HWLOC_OBJ_NUMANODE HWLOC_OBJ_NODE
 #endif
@@ -106,7 +107,10 @@ typedef int kmp_hwloc_depth_t;
 #else
 typedef unsigned int kmp_hwloc_depth_t;
 #endif
-#endif
+#endif // KMP_AFFINITY_SUPPORTED
+extern hwloc_topology_t __kmp_hwloc_topology;
+extern int __kmp_hwloc_error;
+#endif // KMP_USE_HWLOC
 
 #if KMP_ARCH_X86 || KMP_ARCH_X86_64
 #include <xmmintrin.h>
@@ -660,11 +664,6 @@ typedef BOOL (*kmp_SetThreadGroupAffinity_t)(HANDLE, const GROUP_AFFINITY *,
                                              GROUP_AFFINITY *);
 extern kmp_SetThreadGroupAffinity_t __kmp_SetThreadGroupAffinity;
 #endif /* KMP_OS_WINDOWS */
-
-#if KMP_USE_HWLOC
-extern hwloc_topology_t __kmp_hwloc_topology;
-extern int __kmp_hwloc_error;
-#endif
 
 extern size_t __kmp_affin_mask_size;
 #define KMP_AFFINITY_CAPABLE() (__kmp_affin_mask_size > 0)
