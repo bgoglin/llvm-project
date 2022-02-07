@@ -1608,6 +1608,7 @@ static int __kmp_hwloc_get_best_target(hwloc_topology_t topology,
   if (!memattr_flags) {
     if (hwloc_memattr_get_flags(topology, mid, &memattr_flags) < 0) {
       KE_TRACE(30, ("__kmp_alloc (hwloc): Unable to retrieve memattr flags.\n"));
+      free(nodes);
       return -1;
     }
   }
