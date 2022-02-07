@@ -4184,8 +4184,8 @@ void __kmp_affinity_uninitialize(void) {
   }
 #if KMP_USE_HWLOC
   if (__kmp_hwloc_topology != NULL) {
-    hwloc_topology_destroy(__kmp_hwloc_topology);
-    __kmp_hwloc_topology = NULL;
+    /* hwloc_topology_destroy(__kmp_hwloc_topology); */
+    /* __kmp_hwloc_topology = NULL; */
   }
 #endif
   if (__kmp_hw_subset) {

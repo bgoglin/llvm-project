@@ -990,7 +990,10 @@ typedef omp_memspace_handle_t kmp_memspace_t; // placeholder
 
 typedef struct kmp_allocator_t {
   omp_memspace_handle_t memspace;
-  void **memkind; // pointer to memkind
+  union {
+    void **memkind; // pointer to memkind
+    void **hwloc; //pointer to hwloc allocation structures
+  };
   size_t alignment;
   omp_alloctrait_value_t fb;
   kmp_allocator_t *fb_data;

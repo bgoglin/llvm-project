@@ -14,6 +14,8 @@
 #include "kmp_io.h"
 #include "kmp_wrapper_malloc.h"
 
+#include <memory_resource>
+
 #include <hwloc.h>
 
 // Disable bget when it is not used
@@ -1223,6 +1225,39 @@ void ___kmp_thread_free(kmp_info_t *th, void *ptr KMP_SRC_LOC_DECL) {
 }
 
 /* OMP 5.0 Memory Management support */
+/* hwloc experimental API: */
+// hwloc_alloc && hwloc_free
+class kmp_hwloc_memory_allocator: public std::pmr::memory_resource { /* requires C++17 */
+  public:
+    kmp_hwloc_memory_allocator() = default;
+    kmp_hwloc_memory_allocator(hwloc_obj_t node) : node{node} {}
+    void *do_allocate(size_t size, [[maybe_unused]] size_t align = alignof(max_align_t)) override {
+        return hwloc_alloc_membind_policy(__kmp_hwloc_topology, size, node->nodeset,
+                                          HWLOC_MEMBIND_BIND, HWLOC_MEMBIND_BYNODESET);
+    }
+    void do_deallocate(void *ptr, size_t size, [[maybe_unused]] size_t align = alignof(max_align_t)) override {
+      hwloc_free(__kmp_hwloc_topology, ptr, size);
+    }
+    bool do_is_equal(const std::pmr::memory_resource& other) const noexcept override {
+      return &other == this;
+    }
+  private:
+    hwloc_obj_t node;
+};
+// kinds we are going to use
+struct kmp_hwloc_kind {
+  hwloc_memattr_id_t mid;
+  unsigned long memattr_flags;
+  unsigned long node_flags;
+};
+#define HWLOC_LARGE_CAPACITY_THRESHOLD (600ULL * 1024 * 1024 * 1024) // 600GiB
+static struct kmp_hwloc_kind **hwloc_default = NULL; // by default: low_lat
+static struct kmp_hwloc_kind *hwloc_hbw = NULL;
+static struct kmp_hwloc_kind *hwloc_low_lat = NULL;
+static struct kmp_hwloc_kind *hwloc_large_cap = NULL;
+static kmp_hwloc_memory_allocator *hwloc_memory_upstreams = NULL;
+static std::pmr::synchronized_pool_resource **hwloc_memory_allocators = NULL;
+
 static const char *kmp_mk_lib_name;
 static void *h_memkind;
 /* memkind experimental API: */
@@ -1416,7 +1451,50 @@ omp_allocator_handle_t __kmpc_init_allocator(int gtid, omp_memspace_handle_t ms,
   } else if (al->fb == omp_atv_default_mem_fb) {
     al->fb_data = (kmp_allocator_t *)omp_default_mem_alloc;
   }
-  if (__kmp_memkind_available) {
+  if (!KMP_IS_TARGET_MEM_SPACE(ms) && __kmp_hwloc_available) {
+    if (ms == omp_high_bw_mem_space) {
+      if (al->memkind == (void *)omp_atv_interleaved || !hwloc_hbw) {
+        // interleaved HBW is requested but not available --> return NULL allocator
+        __kmp_free(al);
+        return omp_null_allocator;
+      }
+      al->hwloc = (void **)&hwloc_hbw;
+    } else if (ms == omp_large_cap_mem_space) {
+      if (al->memkind == (void *)omp_atv_interleaved || !hwloc_large_cap) {
+        // Large Capacity is requested but not available --> return NULL allocator
+        __kmp_free(al);
+        return omp_null_allocator;
+      }
+      al->hwloc = (void **)&hwloc_large_cap;
+    } else if (ms == omp_low_lat_mem_space) {
+      if (al->memkind == (void *)omp_atv_interleaved || !hwloc_low_lat) {
+        // Low latency is requested but not available --> return NULL allocator
+        __kmp_free(al);
+        return omp_null_allocator;
+      }
+      al->hwloc = (void **)&hwloc_low_lat;
+    } else {
+      if (al->memkind == (void *)omp_atv_interleaved) {
+        // No interleaved memory available yet
+        __kmp_free(al);
+        return omp_null_allocator;
+      }
+      al->hwloc = (void **)hwloc_default;
+      switch ((*hwloc_default)->mid) {
+        case HWLOC_MEMATTR_ID_CAPACITY:
+        case HWLOC_MEMATTR_ID_LOCALITY:
+        case HWLOC_MEMATTR_ID_BANDWIDTH:
+        case HWLOC_MEMATTR_ID_LATENCY:
+          break;
+        default:
+          if (hwloc_memattr_get_flags(__kmp_hwloc_topology, (*hwloc_default)->mid, &(*hwloc_default)->memattr_flags) < 0) {
+            KE_TRACE(30, ("__kmpc_init_allocator (hwloc): Unable to retrieve memattr flags.\n"));
+            __kmp_free(al);
+            return omp_null_allocator;
+          }
+      }
+    }
+  } else if (__kmp_memkind_available) {
     // Let's use memkind library if available
     if (ms == omp_high_bw_mem_space) {
       if (al->memkind == (void *)omp_atv_interleaved && mk_hbw_interleave) {
@@ -1485,7 +1563,7 @@ typedef struct kmp_mem_desc { // Memory block descriptor
   size_t size_orig; // Original size requested
   void *ptr_align; // Pointer to aligned memory, returned
   kmp_allocator_t *allocator; // allocator
-  int hwloc_allocated; // Whether hwloc provided the memory
+  unsigned numa_id; // NUMA OS id of the allocated memory
 } kmp_mem_desc_t;
 static int alignment = sizeof(void *); // align to pointer size by default
 
@@ -1551,13 +1629,68 @@ void __kmp_init_hwloc(void)
       KE_TRACE(10, (err_msg, "hwloc_topology_load()"));
     }
   }
+  // Create 1 pooled allocator per NUMA + 1 per interleave case
   __kmp_hwloc_available = !__kmp_hwloc_error;
 #endif // KMP_USE_HWLOC
+  if (__kmp_hwloc_available) {
+    // Create 1 pooled allocator per NUMA + 1 per interleave case (<-TBD)
+    const unsigned nnodes = hwloc_get_nbobjs_by_type(__kmp_hwloc_topology, HWLOC_OBJ_NUMANODE);
+    hwloc_memory_upstreams = new kmp_hwloc_memory_allocator[nnodes];
+    hwloc_memory_allocators = (std::pmr::synchronized_pool_resource **)malloc((1+nnodes) * sizeof(*hwloc_memory_allocators));
+    hwloc_obj_t node = NULL;
+    bool has_hbw = false, has_low_lat = false, has_large_cap = false;
+    while ((node = hwloc_get_next_obj_by_type(__kmp_hwloc_topology, HWLOC_OBJ_NUMANODE, node))) {
+      hwloc_memory_upstreams[node->os_index] = kmp_hwloc_memory_allocator{ node };
+      hwloc_memory_allocators[node->os_index] = new std::pmr::synchronized_pool_resource{ &hwloc_memory_upstreams[node->os_index] };
+      if (node->subtype && 0 == strncmp(node->subtype, "MCDRAM", 6))
+        has_hbw = true;
+      else if (HWLOC_LARGE_CAPACITY_THRESHOLD <= node->attr->numanode.local_memory)
+        has_large_cap = true;
+      else
+        has_low_lat = true; // Considering DRAM is low_lat.
+    }
+    hwloc_memory_allocators[nnodes] = nullptr; // sentinel value
+    /* TODO: maybe restrict the search to a subset of topology's nodes if
+     * the user wants to? */
+    /* unsigned long node_flags = HWLOC_LOCAL_NUMANODE_FLAG_ALL; */
+    if (has_hbw)
+      hwloc_hbw = new kmp_hwloc_kind { HWLOC_MEMATTR_ID_BANDWIDTH,
+        HWLOC_MEMATTR_FLAG_HIGHER_FIRST, HWLOC_LOCAL_NUMANODE_FLAG_ALL };
+    if (has_low_lat)
+      hwloc_low_lat = new kmp_hwloc_kind { HWLOC_MEMATTR_ID_LATENCY,
+        HWLOC_MEMATTR_FLAG_LOWER_FIRST, HWLOC_LOCAL_NUMANODE_FLAG_ALL };
+    if (has_large_cap)
+      hwloc_large_cap = new kmp_hwloc_kind { HWLOC_MEMATTR_ID_CAPACITY, HWLOC_MEMATTR_FLAG_HIGHER_FIRST,
+        HWLOC_LOCAL_NUMANODE_FLAG_LARGER_LOCALITY | HWLOC_LOCAL_NUMANODE_FLAG_SMALLER_LOCALITY };
+    hwloc_default = &hwloc_low_lat;
+  }
 }
 
 void __kmp_fini_hwloc(void)
 {
   if (__kmp_hwloc_available) {
+    // Freeing the hwloc kind structures
+    if (hwloc_default) {
+      hwloc_default = NULL;
+    }
+    if (hwloc_hbw) {
+      delete hwloc_hbw;
+      hwloc_hbw = NULL;
+    }
+    if (hwloc_low_lat) {
+      delete hwloc_low_lat;
+      hwloc_low_lat = NULL;
+    }
+    if (hwloc_large_cap) {
+      delete hwloc_large_cap;
+      hwloc_large_cap = NULL;
+    }
+    for (uintptr_t alid = 0; hwloc_memory_allocators[alid]; ++alid)
+      delete hwloc_memory_allocators[alid];
+    free(hwloc_memory_allocators);
+    hwloc_memory_allocators = NULL;
+    delete[] hwloc_memory_upstreams;
+    hwloc_memory_upstreams = NULL;
 #if KMP_USE_HWLOC
     /* __kmp_hwloc_topology in globals will be initialised *AFTER* we
      * initialise the allocator.  Therefore, we will be doing the
@@ -1569,7 +1702,13 @@ void __kmp_fini_hwloc(void)
      * already been destroyed by the time we reach this point in the code.
      * Hopefully, there is no release of memory expected from any allocator
      * between these two steps. */
-    /* hwloc_topology_destroy(__kmp_hwloc_topology); */
+    /* The above text was valid until we add the pooled allocators which use
+     * the upstreams that depends on __kmp_hwloc_topology.  Therefore, we NEED
+     * the topology to survive at least until we reach the current point.  We
+     * will then remove the topology destruction from
+     * __kmp_affinity_uninitialize() and call it here. */
+    hwloc_topology_destroy(__kmp_hwloc_topology);
+    __kmp_hwloc_topology = NULL;
 #endif // KMP_USE_HWLOC
   }
 
@@ -1578,6 +1717,7 @@ void __kmp_fini_hwloc(void)
 
 static int __kmp_hwloc_get_best_target(hwloc_topology_t topology,
                                        hwloc_memattr_id_t mid,
+                                       unsigned long memattr_flags,
                                        struct hwloc_location *initiator,
                                        hwloc_obj_t *node,
                                        unsigned long node_flags) {
@@ -1587,10 +1727,9 @@ static int __kmp_hwloc_get_best_target(hwloc_topology_t topology,
   /* We have to traverse the targets ourself to find the best one that is also
    * included in our subset. */
   unsigned nnodes;
-  hwloc_const_nodeset_t topo_nodeset = hwloc_topology_get_topology_nodeset(topology);
-  const unsigned max_nnodes = nnodes = hwloc_bitmap_weight(topo_nodeset);
+  const unsigned max_nnodes = nnodes = hwloc_get_nbobjs_by_type(__kmp_hwloc_topology, HWLOC_OBJ_NUMANODE);
   hwloc_obj_t *nodes = (hwloc_obj_t *) malloc(sizeof(hwloc_obj_t[max_nnodes]));
-  KMP_ASSERT(nodes);
+  KMP_ASSERT(nodes && memattr_flags && node_flags);
   if (hwloc_get_local_numanode_objs(topology, initiator, &nnodes, nodes, node_flags) < 0) {
     KE_TRACE(30, ("__kmp_alloc (hwloc): Unable to retrieve the NUMA local objects.\n"));
     free(nodes);
@@ -1602,19 +1741,6 @@ static int __kmp_hwloc_get_best_target(hwloc_topology_t topology,
   /* Search for the best target */
   int found = 0;
   hwloc_uint64_t best_value;
-  unsigned long memattr_flags =
-      mid == HWLOC_MEMATTR_ID_CAPACITY  ? HWLOC_MEMATTR_FLAG_HIGHER_FIRST
-    : mid == HWLOC_MEMATTR_ID_LOCALITY  ? HWLOC_MEMATTR_FLAG_HIGHER_FIRST
-    : mid == HWLOC_MEMATTR_ID_BANDWIDTH ? HWLOC_MEMATTR_FLAG_HIGHER_FIRST
-    : mid == HWLOC_MEMATTR_ID_LATENCY   ? HWLOC_MEMATTR_FLAG_LOWER_FIRST
-    : 0;
-  if (!memattr_flags) {
-    if (hwloc_memattr_get_flags(topology, mid, &memattr_flags) < 0) {
-      KE_TRACE(30, ("__kmp_alloc (hwloc): Unable to retrieve memattr flags.\n"));
-      free(nodes);
-      return -1;
-    }
-  }
   for (size_t nid = 0; nid < nnodes; ++nid) {
     hwloc_uint64_t val;
     if (hwloc_memattr_get_value(topology, mid, nodes[nid], initiator, 0, &val) == 0) {
@@ -1661,54 +1787,70 @@ void *__kmp_alloc(int gtid, size_t algn, size_t size,
     align = algn; // max of allocator trait, parameter and sizeof(void*)
   desc.size_orig = size;
   desc.size_a = size + sz_desc + align;
-  desc.hwloc_allocated = 0;
 
   if (__kmp_hwloc_available) {
-    omp_memspace_handle_t memspace = al->memspace;
+    struct kmp_hwloc_kind *kind;
     if (allocator < kmp_max_mem_alloc) {
       /* If we have a predefined allocator, retrieve the allocation space */
-      memspace = allocator == omp_default_mem_alloc ? omp_default_mem_space
-        : allocator == omp_const_mem_alloc ? omp_const_mem_space
-        : allocator == omp_high_bw_mem_alloc ? omp_high_bw_mem_space
-        : allocator == omp_low_lat_mem_alloc ? omp_low_lat_mem_space
-        : allocator == omp_large_cap_mem_alloc ? omp_large_cap_mem_space
-        : (omp_memspace_handle_t) -1;
+      kind = allocator == omp_default_mem_alloc ? *hwloc_default
+        /* : allocator == omp_const_mem_alloc ? omp_const_mem_space */
+        : allocator == omp_high_bw_mem_alloc ? hwloc_hbw
+        : allocator == omp_low_lat_mem_alloc ? hwloc_low_lat
+        : allocator == omp_large_cap_mem_alloc ? hwloc_large_cap
+        : (struct kmp_hwloc_kind *) NULL;
+    } else {
+      kind = *RCAST(struct kmp_hwloc_kind **, al->hwloc);
     }
-    if (memspace == omp_high_bw_mem_space
-        || memspace == omp_low_lat_mem_space
-        || memspace == omp_large_cap_mem_space) {
+    if (kind) {
+      hwloc_obj_t node;
       hwloc_bitmap_t cpuset;
       struct hwloc_location initiator;
-      hwloc_obj_t node;
-      hwloc_memattr_id_t mid = memspace == omp_high_bw_mem_space ? HWLOC_MEMATTR_ID_BANDWIDTH
-        : memspace == omp_low_lat_mem_space ? HWLOC_MEMATTR_ID_LATENCY
-        : /* memspace == omp_large_cap_mem_space ? */ HWLOC_MEMATTR_ID_CAPACITY;
       cpuset = hwloc_bitmap_alloc();
       if (cpuset) {
 	hwloc_get_last_cpu_location(__kmp_hwloc_topology, cpuset, HWLOC_CPUBIND_THREAD); /* FIXME: does the runtime know the current binding? */
 	initiator.type = HWLOC_LOCATION_TYPE_CPUSET;
 	initiator.location.cpuset = cpuset;
-        unsigned long node_flags = HWLOC_LOCAL_NUMANODE_FLAG_ALL;
-        /* TODO: maybe restrict the search to a subset of topology's nodes if
-         * the user wants to? */
-        if (mid == HWLOC_MEMATTR_ID_CAPACITY) {
-          node_flags = HWLOC_LOCAL_NUMANODE_FLAG_LARGER_LOCALITY | HWLOC_LOCAL_NUMANODE_FLAG_SMALLER_LOCALITY;
-        }
-        if (__kmp_hwloc_get_best_target(__kmp_hwloc_topology, mid, &initiator, &node, node_flags) == 0) {
+        if (__kmp_hwloc_get_best_target(__kmp_hwloc_topology, kind->mid, kind->memattr_flags, &initiator, &node, kind->node_flags) == 0) {
+          {/* DEBUG */
           constexpr ssize_t max_len = 1024;
           char cpuset_str[max_len];
           int len = hwloc_bitmap_snprintf(cpuset_str, max_len, cpuset);
-          fprintf(stderr, "got node L%u P%u for attr %u from node %s%s\n", node->logical_index, node->os_index, mid, cpuset_str, len > max_len ? " (truncated)" : "");
-	  ptr = hwloc_alloc_membind_policy(__kmp_hwloc_topology, desc.size_a, node->nodeset, HWLOC_MEMBIND_BIND, HWLOC_MEMBIND_BYNODESET);
-	  if (ptr) {
-	    desc.hwloc_allocated = 1;
-	    hwloc_bitmap_free(cpuset);
-	    goto ready;
-	  }
-	} else {
-	  fprintf(stderr,"got no node for attr %u\n", mid);
+          fprintf(stderr, "got node L%u P%u for attr %u from node %s%s\n", node->logical_index, node->os_index, kind->mid, cpuset_str, len > max_len ? " (truncated)" : "");
+          /* END DEBUG */}
+          if (al->pool_size > 0) {
+            // custom allocator with pool size requested
+            kmp_uint64 used =
+              KMP_TEST_THEN_ADD64((kmp_int64 *)&al->pool_used, desc.size_a);
+            if (used + desc.size_a > al->pool_size) {
+              // not enough space, need to go fallback path
+              KMP_TEST_THEN_ADD64((kmp_int64 *)&al->pool_used, -desc.size_a);
+            } else {
+              // pool has enough space
+              ptr = hwloc_memory_allocators[node->os_index]->allocate(desc.size_a);
+            }
+          } else {
+            // custom allocator, pool size not requested
+            ptr = hwloc_memory_allocators[node->os_index]->allocate(desc.size_a);
+          }
+          if (ptr == NULL) {
+            if (al->fb == omp_atv_default_mem_fb) {
+              /* potentially allocate with a hwloc_default_allocator */
+              al = (kmp_allocator_t *)omp_default_mem_alloc;
+            } else if (al->fb == omp_atv_abort_fb) {
+              KMP_ASSERT(0); // abort fallback requested
+            } else if (al->fb == omp_atv_allocator_fb) {
+              KMP_ASSERT(al != al->fb_data);
+              al = al->fb_data;
+            }
+            hwloc_bitmap_free(cpuset);
+            return __kmp_alloc(gtid, algn, size, (omp_allocator_handle_t)al);
+          }
+        } else {
+	  fprintf(stderr,"got no node for attr %u\n", kind->mid);
 	}
 	hwloc_bitmap_free(cpuset);
+        desc.numa_id = node->os_index;
+        goto ready;
       }
     }
   }
@@ -1957,10 +2099,14 @@ void ___kmpc_free(int gtid, void *ptr, omp_allocator_handle_t allocator) {
   KMP_DEBUG_ASSERT(al);
 
   if (__kmp_hwloc_available) {
-    if (desc.hwloc_allocated) {
-      hwloc_free(__kmp_hwloc_topology, desc.ptr_alloc, desc.size_a);
-      return;
+    if (al->pool_size > 0) { // custom allocator with pool size requested
+      kmp_uint64 used =
+        KMP_TEST_THEN_ADD64((kmp_int64 *)&al->pool_used, -desc.size_a);
+      KMP_DEBUG_USE_VAR(used);
+      KMP_DEBUG_ASSERT(used >= desc.size_a);
     }
+    hwloc_memory_allocators[desc.numa_id]->deallocate(desc.ptr_alloc, desc.size_a);
+    return;
   }
   if (__kmp_memkind_available) {
     if (oal < kmp_max_mem_alloc) {
