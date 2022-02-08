@@ -1976,7 +1976,7 @@ void ___kmpc_free(int gtid, void *ptr, omp_allocator_handle_t allocator) {
       if (al->pool_size > 0) { // custom allocator with pool size requested
         kmp_uint64 used =
             KMP_TEST_THEN_ADD64((kmp_int64 *)&al->pool_used, -desc.size_a);
-        (void)used; // to suppress compiler warning
+        KMP_DEBUG_USE_VAR(used);
         KMP_DEBUG_ASSERT(used >= desc.size_a);
       }
       kmp_mk_free(*al->memkind, desc.ptr_alloc);
@@ -1985,7 +1985,7 @@ void ___kmpc_free(int gtid, void *ptr, omp_allocator_handle_t allocator) {
     if (oal > kmp_max_mem_alloc && al->pool_size > 0) {
       kmp_uint64 used =
           KMP_TEST_THEN_ADD64((kmp_int64 *)&al->pool_used, -desc.size_a);
-      (void)used; // to suppress compiler warning
+      KMP_DEBUG_USE_VAR(used);
       KMP_DEBUG_ASSERT(used >= desc.size_a);
     }
     __kmp_thread_free(__kmp_thread_from_gtid(gtid), desc.ptr_alloc);
